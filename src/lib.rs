@@ -50,6 +50,46 @@ impl Predicate for SimdMultiPolygon {
     }
 }
 
+/// Edges-per-multipolygon at or below which the hybrid uses SIMD; above
+/// which it uses the interval tree. Picked from the criterion bench:
+/// SIMD wins 4x at n=16, breaks even ~n=120, loses 17x at n=4096. 64 is
+/// inside the SIMD-wins zone with margin.
+pub const HYBRID_EDGE_THRESHOLD: usize = 64;
+
+fn count_edges(mp: &MultiPolygon<f64>) -> usize {
+    mp.iter()
+        .map(|poly| {
+            std::iter::once(poly.exterior())
+                .chain(poly.interiors().iter())
+                .map(|ring| ring.0.len().saturating_sub(1))
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+/// Per-polygon dispatch: SIMD for small polygons, IntervalTree for large.
+/// Match-based, no vtable.
+pub enum HybridPredicate {
+    Simd(SimdMultiPolygon),
+    IntervalTree(IntervalTreePredicate),
+}
+
+impl Predicate for HybridPredicate {
+    fn build(mp: &MultiPolygon<f64>) -> Self {
+        if count_edges(mp) <= HYBRID_EDGE_THRESHOLD {
+            Self::Simd(SimdMultiPolygon::build(mp))
+        } else {
+            Self::IntervalTree(IntervalTreePredicate::build(mp))
+        }
+    }
+    fn contains(&self, p: Point<f64>) -> bool {
+        match self {
+            Self::Simd(s) => s.contains(p),
+            Self::IntervalTree(t) => t.contains(p),
+        }
+    }
+}
+
 pub struct MultiPolygonIndex<P: Predicate = IntervalTreePredicate> {
     rtree: RTree<GeomWithData<Rectangle<(f64, f64)>, usize>>,
     trees: Vec<P>,
@@ -103,10 +143,13 @@ impl<P: Predicate> MultiPolygonIndex<P> {
 }
 
 /// Whichever predicate is configured. The example uses this so the
-/// `simd-predicate` feature flag flips the whole pipeline.
-#[cfg(feature = "simd-predicate")]
+/// `simd-predicate` and `hybrid-predicate` feature flags flip the whole
+/// pipeline. `hybrid-predicate` takes precedence if both are enabled.
+#[cfg(feature = "hybrid-predicate")]
+pub type DefaultIndex = MultiPolygonIndex<HybridPredicate>;
+#[cfg(all(feature = "simd-predicate", not(feature = "hybrid-predicate")))]
 pub type DefaultIndex = MultiPolygonIndex<SimdMultiPolygon>;
-#[cfg(not(feature = "simd-predicate"))]
+#[cfg(all(not(feature = "simd-predicate"), not(feature = "hybrid-predicate")))]
 pub type DefaultIndex = MultiPolygonIndex<IntervalTreePredicate>;
 
 #[cfg(test)]
@@ -178,5 +221,15 @@ mod tests {
     #[test]
     fn simd_count_points_par() {
         count_points_par_returns_one_count_per_polygon::<SimdMultiPolygon>();
+    }
+
+    #[test]
+    fn hybrid_for_each_containing() {
+        for_each_containing_visits_each_polygon_at_most_once::<HybridPredicate>();
+    }
+
+    #[test]
+    fn hybrid_count_points_par() {
+        count_points_par_returns_one_count_per_polygon::<HybridPredicate>();
     }
 }

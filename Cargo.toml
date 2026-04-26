@@ -18,6 +18,7 @@ rstar = "0.12.2"
 [features]
 default = []
 simd-predicate = []
+hybrid-predicate = []
 
 [profile.release]
 debug = "line-tables-only"
