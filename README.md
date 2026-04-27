@@ -1,15 +1,15 @@
 # polygon
 
-Joins ~130M Microsoft building centroids against ~33k US ZIP code polygons and
+Joins ~141M Microsoft building centroids against ~33k US ZIP code polygons and
 prints the top 5 ZIPs by building count. The interesting piece is
-`MultiPolygonIndex` in `src/main.rs` — an `rstar` R-tree of bounding boxes
+`MultiPolygonIndex` in `src/lib.rs` — an `rstar` R-tree of bounding boxes
 layered over one `IntervalTreeMultiPolygon` per polygon. Builds once, queries
 in parallel.
 
 ## Run
 
 ```
-cargo run --release
+cargo run --release --example zipcode_join
 ```
 
 Expects two files under `data/`:
@@ -73,8 +73,80 @@ multipoints.
 ## Expected output
 
 ```
-<N> points joined in ~4.3s (~30M pts/s)
-<top 5 ZIPs by building count>
+141611717 points joined in ~3.4s (~41M pts/s)
+77494    42147
+73099    41611
+78641    40843
+78660    39730
+60629    38910
 ```
 
-on a recent multi-core box with both files on local SSD.
+on a recent multi-core box with both files on local SSD (M2 Pro reference).
+
+## Predicate variants
+
+The predicate is generic over a `Predicate` trait (see `src/lib.rs`).
+Three impls and feature-flagged defaults:
+
+- **IntervalTree** (`IntervalTreePredicate`, default) — `geo`'s
+  `IntervalTreeMultiPolygon`. Y-interval tree of edges + winding-number test.
+  Sub-linear in edge count.
+- **SIMD** (`SimdMultiPolygon`, behind `--features simd-predicate`) —
+  NEON crossing-number sweep across all edges. Scalar fallback off-aarch64.
+- **Hybrid** (`HybridPredicate`, behind `--features hybrid-predicate`) —
+  Picks SIMD or IntervalTree per polygon at build time, threshold
+  `HYBRID_EDGE_THRESHOLD = 64`.
+
+Per-call wall-clock from `cargo bench --bench predicate` on Apple Silicon:
+
+| edges | IntervalTree | SIMD | Hybrid |
+|------:|-------------:|-----:|-------:|
+| 16    | 25.5 ns | 6.0 ns | 6.3 ns |
+| 64    | 31.0 ns | 18.1 ns | 18.3 ns |
+| 128   | 39.7 ns | 36.2 ns | 39.7 ns |
+| 4096  | 60.8 ns | 1048 ns | 61.0 ns |
+
+End-to-end on the full 141M-point dataset, the predicate variants are a
+wash because dense urban ZIPs (where most points fall) all have hundreds
+of edges and run via the IntervalTree path either way. SIMD-only
+*regresses* 2.9× because rural Western ZIPs with 5k–15k edges get hit
+linearly. Hybrid matches IntervalTree to within noise.
+
+A Gungraun (Valgrind callgrind) bench for instruction-count comparisons
+lives in `benches/predicate_gungraun.rs`. Linux + valgrind only:
+
+```
+cargo install --version 0.18.1 gungraun-runner
+cargo bench --bench predicate_gungraun
+```
+
+## Metal GPU experiment (dead end, kept for documentation)
+
+`src/gpu.rs` + `src/pip.metal` + `examples/zipcode_join_gpu.rs` build a
+Metal compute kernel for the predicate, with a CPU-side rstar AABB filter
+producing per-(point, polygon) tasks. Run with
+`cargo run --release --example zipcode_join_gpu`.
+
+End-to-end **6.78s** vs **3.42s** for the CPU IntervalTree path, with
+phase breakdown:
+
+| phase | time |
+|-------|-----:|
+| rstar filter (CPU) | 2.00s — 267M tasks |
+| pack f32 points | 0.05s |
+| alloc Metal buffers | 0.88s |
+| GPU dispatch + wait | 1.93s — 138M tasks/s |
+| readback (shared mem) | 0.00s |
+
+Even with zero GPU compute the CPU side already runs over 4.87s, exceeding
+the IntervalTree baseline. Three changes would make GPU competitive but
+each is significant work:
+1. Sort tasks by polygon size before dispatch (kills warp divergence).
+2. No-copy Metal buffers (page-aligned `newBufferWithBytesNoCopy`).
+3. Move the AABB filter onto the GPU (uniform grid hash) — the big one.
+
+Without (3), the CPU rstar filter alone exceeds the entire CPU
+IntervalTree wall time. The unstated assumption that "GPU = faster" fails
+because the IntervalTree's edge filter cuts per-call work to ~5 candidate
+edges, while a GPU brute-force linear scan does the full polygon every
+time. Compute parity, not speed-up.
