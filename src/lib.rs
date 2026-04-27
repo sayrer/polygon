@@ -11,6 +11,7 @@
 //! query many times from any number of threads: both predicates and
 //! `MultiPolygonIndex<P>` are `Send + Sync`.
 
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use geo::algorithm::Contains;
@@ -22,6 +23,9 @@ use rstar::{AABB, RTree};
 
 mod simd;
 pub use simd::SimdMultiPolygon;
+
+#[cfg(target_os = "macos")]
+pub mod gpu;
 
 pub trait Predicate: Send + Sync {
     fn build(mp: &MultiPolygon<f64>) -> Self;
@@ -124,11 +128,19 @@ impl<P: Predicate> MultiPolygonIndex<P> {
 
     pub fn for_each_containing<F: FnMut(usize)>(&self, point: Point<f64>, mut f: F) {
         let envelope = AABB::from_point((point.x(), point.y()));
-        for hit in self.rtree.locate_in_envelope_intersecting(&envelope) {
-            if self.trees[hit.data].contains(point) {
-                f(hit.data);
-            }
-        }
+        // Internal-iteration variant of `locate_in_envelope_intersecting`
+        // walks the R-tree on the call stack instead of pushing children onto
+        // a SmallVec — avoids the per-query heap allocation that the iterator
+        // form pays once the stack overflows its 24-slot inline buffer.
+        let _ = self.rtree.locate_in_envelope_intersecting_int(
+            &envelope,
+            |hit| -> ControlFlow<()> {
+                if self.trees[hit.data].contains(point) {
+                    f(hit.data);
+                }
+                ControlFlow::Continue(())
+            },
+        );
     }
 
     pub fn count_points_par(&self, points: &[Point<f64>]) -> Vec<u64> {
